@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Douyin Comment Collector",
+  "version": "0.6.7",
+  "description": "Collect Douyin comments, replies, and comment image links after user action.",
+  "permissions": ["activeTab", "scripting", "storage", "downloads"],
+  "host_permissions": ["https://www.douyin.com/*", "https://www.iesdouyin.com/*"],
+  "action": {
+    "default_title": "Douyin Comment Collector",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.douyin.com/*", "https://www.iesdouyin.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
