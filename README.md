@@ -2,7 +2,23 @@
 
 抖音评论区采集 Chrome / Edge 浏览器插件。
 
-当前版本：`0.3.6`
+当前版本：`0.7.4`
+
+## v0.7.4 更新
+
+- **用 alt 属性精准区分表情与真实图片**：实测发现表情/emoji 的 `<img>` 带 `alt`（如 `alt="[偷笑]"`），用户真实上传图的 `<img>` 没有 `alt`。据此新增 `isEmojiByAlt(img)` 判据，带非空 `alt` 的图一律判为表情并过滤。
+- **三处入口统一拦截**：在 `extractAnchorImageUrls`、`extractCommentImageUrls`、`isCommentImage` 三个采图入口都加了 alt 判断，确保任意路径取到的表情都被拦下。
+- **不再依赖易变的 URL 特征**：放弃 v0.7.2 那条 `~tplv- + from=2064092626` 规则（副作用过大，导致漏采、误删真实图），改用更稳定的 DOM 结构判据。
+
+## v0.7.1 更新
+
+- **修复采集内容错位**：以稳定锚点 `data-e2e="comment-item"` 逐卡片硬切割，彻底解决相邻评论用户名/内容/图片粘连串行的错位问题。
+- **锚点优先 + class 兜底**：优先用 `data-e2e` 锚点定位评论卡片，仅当锚点失效（抖音改版）时才回退到旧的打分扫描法，避免哈希 class 变动导致脚本失效。
+- **卡片自身头部边界**：用 `compareDocumentPosition` + 首个回复容器切分，字段只取自身这条评论，不越界到楼中楼。
+
+## v0.7.0 更新
+
+- **新增表情包/贴纸过滤**：统一 `isStickerOrEmojiUrl(url)`，过滤 `s=sticker`、`emoji`、`twemoji`、`/effect/` 等明确表情特征的图片链接，只保留用户真实上传的评论图。
 
 ## v0.3.6 更新
 
@@ -99,7 +115,7 @@
 
 ## 安装步骤
 
-1. 解压 `douyin-comment-extension-v0.3.6.zip`。
+1. 解压 `douyin-comment-extension-v0.7.4.zip`。
 2. Chrome：打开 `chrome://extensions/`；Edge：打开 `edge://extensions/`。
 3. 开启「开发者模式」。
 4. 点击「加载已解压的扩展程序」，选择解压后的 `douyin-comment-extension` 文件夹。
