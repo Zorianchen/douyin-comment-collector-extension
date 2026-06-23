@@ -27,18 +27,18 @@
       </div>
     </section>
 
-    <section class="progressBox" aria-live="polite">
-      <div><span>轮次</span><strong id="progressTick">0</strong></div>
-      <div><span>本轮新增</span><strong id="progressAdded">0</strong></div>
-      <div><span>连续无新增</span><strong id="progressStable">0</strong></div>
-      <div><span>监听</span><strong id="progressObserver">否</strong></div>
-    </section>
-
     <section class="section">
       <h2 class="sectionTitle">评论采集</h2>
       <div class="config">
         <label>
-          <span>最大评论数</span>
+          <span>采集模式</span>
+          <select id="collectMode">
+            <option value="limit">采指定条数</option>
+            <option value="all">采全部评论</option>
+          </select>
+        </label>
+        <label id="maxCommentsField">
+          <span>目标条数</span>
           <input id="maxComments" type="number" min="1" max="10000" step="1" value="2000">
         </label>
         <label>
@@ -53,36 +53,25 @@
           <input id="expandText" type="checkbox" checked>
           <span>展开长评论文本（解决 ... 截断）</span>
         </label>
-        <div class="grid2">
-          <label>
-            <span>每轮展开数</span>
-            <input id="maxExpandPerTick" type="number" min="1" max="15" step="1" value="6">
-          </label>
-          <label>
-            <span>展开等待，毫秒</span>
-            <input id="expandWaitMs" type="number" min="300" max="7000" step="100" value="1600">
-          </label>
-        </div>
       </div>
 
-      <div class="actions">
-        <button id="startBtn" class="primary">开始评论</button>
-        <button id="pauseBtn">暂停</button>
-        <button id="resumeBtn">继续</button>
+      <div class="actions actions-2">
+        <button id="startBtn" class="primary">开始采集</button>
         <button id="stopBtn">停止</button>
+      </div>
+
+      <div class="actions actions-2">
         <button id="dedupeBtn">去重</button>
         <button id="clearBtn" class="danger">清空</button>
       </div>
 
-      <div class="actions">
-        <button id="exportCsvBtn">导出评论 CSV</button>
-        <button id="exportJsonBtn">导出评论 JSON</button>
+      <div class="actions actions-2">
+        <button id="exportCsvBtn">导出 CSV</button>
+        <button id="exportJsonBtn">导出 JSON</button>
       </div>
     </section>
 
-    <button id="diagnoseBtn" class="fullWidth">检测页面</button>
-    <pre id="diagnosis" class="diagnosis">未检测</pre>
-    <p id="message" class="message">打开抖音视频页，点「检测页面」确认后，点开始评论。</p>
+    <p id="message" class="message">提示：建议直接在抖音页面右下角的悬浮面板操作，更直观。打开评论区后点「开始采集」。</p>
   </main>
   <script src="exporter.js"></script>
   <script src="popup.js"></script>

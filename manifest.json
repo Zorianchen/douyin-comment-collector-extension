@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Douyin Comment Collector",
-  "version": "0.6.7",
+  "version": "0.7.4",
   "description": "Collect Douyin comments, replies, and comment image links after user action.",
   "permissions": ["activeTab", "scripting", "storage", "downloads"],
   "host_permissions": ["https://www.douyin.com/*", "https://www.iesdouyin.com/*"],

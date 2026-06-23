@@ -151,6 +151,41 @@ input[type="number"] {
   padding: 8px 10px;
   font-size: 13px;
   outline: none;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+input[type="number"]:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(186,95,54,0.12);
+}
+
+select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 32px 8px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  background-color: #fff;
+  cursor: pointer;
+  outline: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%23ba5f36' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+select:hover {
+  border-color: rgba(186,95,54,0.5);
+}
+
+select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(186,95,54,0.12);
 }
 
 .checkline {
@@ -180,6 +215,10 @@ button:focus-visible {
   grid-template-columns: 1fr 1fr 1fr;
   gap: 6px;
   margin-bottom: 8px;
+}
+
+.actions.actions-2 {
+  grid-template-columns: 1fr 1fr;
 }
 
 .actions:last-child {

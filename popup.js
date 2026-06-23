@@ -4,27 +4,19 @@ const stateEls = {
   statusBadge: document.getElementById("statusBadge"),
   count: document.getElementById("count"),
   statusText: document.getElementById("statusText"),
-  progressTick: document.getElementById("progressTick"),
-  progressAdded: document.getElementById("progressAdded"),
-  progressStable: document.getElementById("progressStable"),
-  progressObserver: document.getElementById("progressObserver"),
   message: document.getElementById("message"),
-  diagnosis: document.getElementById("diagnosis"),
+  collectMode: document.getElementById("collectMode"),
+  maxCommentsField: document.getElementById("maxCommentsField"),
   maxComments: document.getElementById("maxComments"),
   delayMs: document.getElementById("delayMs"),
   collectReplies: document.getElementById("collectReplies"),
   expandText: document.getElementById("expandText"),
-  maxExpandPerTick: document.getElementById("maxExpandPerTick"),
-  expandWaitMs: document.getElementById("expandWaitMs"),
   startBtn: document.getElementById("startBtn"),
-  pauseBtn: document.getElementById("pauseBtn"),
-  resumeBtn: document.getElementById("resumeBtn"),
   stopBtn: document.getElementById("stopBtn"),
   dedupeBtn: document.getElementById("dedupeBtn"),
   clearBtn: document.getElementById("clearBtn"),
   exportCsvBtn: document.getElementById("exportCsvBtn"),
-  exportJsonBtn: document.getElementById("exportJsonBtn"),
-  diagnoseBtn: document.getElementById("diagnoseBtn")
+  exportJsonBtn: document.getElementById("exportJsonBtn")
 };
 
 let activeTab = null;
@@ -65,6 +57,12 @@ function wait(ms) {
   return new Promise(resolve => window.setTimeout(resolve, ms));
 }
 
+/* ── 采集模式：采全部时隐藏「目标条数」 ── */
+function syncModeUI() {
+  if (!stateEls.collectMode || !stateEls.maxCommentsField) return;
+  stateEls.maxCommentsField.style.display = stateEls.collectMode.value === "all" ? "none" : "";
+}
+
 /* ── State ── */
 async function loadState() {
   activeTab = await getActiveTab();
@@ -72,7 +70,7 @@ async function loadState() {
   stateEls.pageHint.textContent = canRun ? "当前是抖音页面，可以采集" : "请先打开抖音页面";
 
   const disable = !canRun;
-  for (const el of [stateEls.startBtn, stateEls.pauseBtn, stateEls.resumeBtn, stateEls.stopBtn, stateEls.dedupeBtn, stateEls.clearBtn, stateEls.diagnoseBtn]) {
+  for (const el of [stateEls.startBtn, stateEls.stopBtn, stateEls.dedupeBtn, stateEls.clearBtn]) {
     el.disabled = disable;
   }
 
@@ -80,10 +78,9 @@ async function loadState() {
   const commentCount = (comments || []).length || (collectorState && collectorState.count) || 0;
 
   stateEls.count.textContent = String(commentCount);
-  stateEls.statusText.textContent = collectorState?.status || "ready";
+  stateEls.statusText.textContent = statusLabel(collectorState?.status || "ready");
   stateEls.statusBadge.textContent = statusLabel(collectorState?.status || "ready");
-  stateEls.message.textContent = collectorState?.message || "打开抖音视频页，点「检测页面」确认后，点开始评论。";
-  renderProgress(collectorState?.progress || {});
+  stateEls.message.textContent = collectorState?.message || "提示：建议直接在抖音页面右下角的悬浮面板操作，更直观。打开评论区后点「开始采集」。";
 
   stateEls.exportCsvBtn.disabled = commentCount === 0;
   stateEls.exportJsonBtn.disabled = commentCount === 0;
@@ -94,21 +91,13 @@ function statusLabel(status) {
   return map[status] || status;
 }
 
-function renderProgress(progress) {
-  stateEls.progressTick.textContent = String(progress.tick || 0);
-  stateEls.progressAdded.textContent = String(progress.added || 0);
-  stateEls.progressStable.textContent = String(progress.stableLoops || 0);
-  stateEls.progressObserver.textContent = progress.observerOn ? "是" : "否";
-}
-
 function readOptions() {
   return {
+    collectAll: stateEls.collectMode.value === "all",
     maxComments: clamp(Number(stateEls.maxComments.value) || 2000, 1, 10000),
     delayMs: clamp(Number(stateEls.delayMs.value) || 2000, 500, 15000),
     collectReplies: Boolean(stateEls.collectReplies.checked),
-    expandText: Boolean(stateEls.expandText.checked),
-    maxExpandPerTick: clamp(Number(stateEls.maxExpandPerTick.value) || 6, 1, 15),
-    expandWaitMs: clamp(Number(stateEls.expandWaitMs.value) || 1600, 300, 7000)
+    expandText: Boolean(stateEls.expandText.checked)
   };
 }
 
@@ -119,8 +108,7 @@ function clamp(value, min, max) {
 /* ── Generic action helper ── */
 async function updateFromContent(action, payload = {}) {
   try {
-    const response = await sendToContent(action, payload);
-    if (response?.diagnosis) renderDiagnosis(response.diagnosis);
+    await sendToContent(action, payload);
     await loadState();
   } catch (error) {
     if (isConnectionError(error)) {
@@ -131,22 +119,9 @@ async function updateFromContent(action, payload = {}) {
   }
 }
 
-function renderDiagnosis(d) {
-  stateEls.diagnosis.textContent = [
-    `页面类型：${d.pageType}`,
-    `评论区：${d.hasCommentArea ? "可能存在" : "未识别"}`,
-    `展开回复按钮：${d.replyExpandButtons}`,
-    `展开文本按钮：${d.textExpandButtons}`,
-    `评论图片：${d.commentImageCount}`,
-    `页面标题：${d.title || ""}`
-  ].filter(Boolean).join("\n");
-}
-
 /* ── Comment events ── */
-stateEls.diagnoseBtn.addEventListener("click", () => updateFromContent("collector:diagnose"));
+stateEls.collectMode.addEventListener("change", syncModeUI);
 stateEls.startBtn.addEventListener("click", () => updateFromContent("collector:start", { options: readOptions() }));
-stateEls.pauseBtn.addEventListener("click", () => updateFromContent("collector:pause"));
-stateEls.resumeBtn.addEventListener("click", () => updateFromContent("collector:resume"));
 stateEls.stopBtn.addEventListener("click", () => updateFromContent("collector:stop"));
 stateEls.dedupeBtn.addEventListener("click", () => updateFromContent("collector:dedupe"));
 stateEls.clearBtn.addEventListener("click", async () => {
@@ -179,4 +154,5 @@ function ts() {
   return Date.now();
 }
 
+syncModeUI();
 loadState();

@@ -5,7 +5,8 @@ if (!globalThis.__douyinCommentCollector) {
     running: false, paused: false, timer: null, observer: null,
     comments: [], seen: new Set(), cardToComment: new WeakMap(),
     expandedButtons: new WeakSet(), expandedTextButtons: new WeakSet(),
-    options: { maxComments: 5000, delayMs: 2000, collectReplies: true, expandText: true, maxExpandPerTick: 999, expandWaitMs: 1600 },
+    options: { maxComments: 5000, delayMs: 2000, collectReplies: true, expandText: true, maxExpandPerTick: 999, expandWaitMs: 1600, collectAll: false },
+    targetCount: 5000,
     progress: { tick: 0, added: 0, updated: 0, expandedText: 0, expandedReplies: 0, stableLoops: 0, scrollTop: 0, scrollHeight: 0, visibleCandidates: 0, observerOn: false, phase: "" },
     state: { status: "ready", message: "Ready", count: 0, lastUpdatedAt: null, currentUrl: location.href, progress: {} },
     listenerRegistered: false
@@ -59,8 +60,12 @@ async function startComments(opts) {
     collectReplies: Boolean(opts.collectReplies !== false),
     expandText: Boolean(opts.expandText !== false),
     maxExpandPerTick: 999,
-    expandWaitMs: cl(opts.expandWaitMs, 300, 7000, 1600)
+    expandWaitMs: cl(opts.expandWaitMs, 300, 7000, 1600),
+    /* 采集模式：true=采全部（忽略 maxComments 上限）；false=只采 maxComments 条，够数立即停 */
+    collectAll: Boolean(opts.collectAll)
   };
+  /* 采全部时把目标拉满，让各阶段的「够数提前停」失效 */
+  cc.targetCount = cc.options.collectAll ? Infinity : cc.options.maxComments;
   const stored = await chrome.storage.local.get(["comments"]);
   cc.comments = dedupeArr(Array.isArray(stored.comments) ? stored.comments : []);
   cc.seen = new Set(cc.comments.map(commentKey));
@@ -108,36 +113,65 @@ async function startComments(opts) {
   return snapshot();
 }
 
-/* ---- 阶段2: 懒加载全部评论 ---- */
+/* ---- 阶段2: 懒加载评论 ----
+ * 抖音是虚拟列表：往下滚时顶部卡片会被卸载，所以 DOM 里始终只有几十个节点，
+ * countCommentCards() 永远到不了 200。
+ * 正确做法：边滚边 extract 累加去重，用「真实累计采集数」判断是否够数。 */
 async function loadAllComments() {
   const container = findCommentScrollContainer();
   if (!container) {
     console.log("[DouyinCollector] loadAllComments: 未找到评论容器");
     return;
   }
-  console.log("[DouyinCollector] loadAllComments: 开始懒加载 (max=" + cc.options.maxComments + ")");
-  setCommentState("running", "正在加载全部评论（滚动触发懒加载）...");
+  console.log("[DouyinCollector] loadAllComments: 开始懒加载 (target=" + cc.targetCount + ")");
+  setCommentState("running", "正在加载评论（滚动触发懒加载）...");
+
+  /* 边滚边采，避免虚拟列表把已加载的评论卸载丢失 */
+  const ingestDuringLoad = () => {
+    const extracted = extractVisibleComments();
+    let added = 0;
+    for (const it of extracted) {
+      const cardNode = it.__cardNode;
+      delete it.__cardNode;
+      const k = commentKey(it);
+      if (!k || cc.seen.has(k)) continue;
+      cc.seen.add(k);
+      if (cardNode) cc.cardToComment.set(cardNode, cc.comments.length);
+      cc.comments.push(it);
+      added++;
+      if (cc.comments.length >= cc.targetCount) break;
+    }
+    return added;
+  };
+
+  container.scrollTop = 0;
+  await sleep(300);
+  ingestDuringLoad();
 
   let lastHeight = 0;
   let stableCount = 0;
 
-  for (let round = 0; round < 60; round++) {
+  for (let round = 0; round < 80; round++) {
     if (!cc.running) return;
-    container.scrollTop = container.scrollHeight;
-    await sleep(1500);
 
-    const currentHeight = container.scrollHeight;
+    /* 先采当前可见评论（虚拟列表会卸载顶部，所以每轮都要抓） */
+    const addedThisRound = ingestDuringLoad();
 
-    /* 提前停止：已加载的卡片数远超用户设置的采集量 */
-    const cardCount = countCommentCards();
-    if (cardCount >= cc.options.maxComments * 2) {
-      console.log("[DouyinCollector] loadAllComments: 卡片数 " + cardCount + " 已超过 " + (cc.options.maxComments * 2) + " → 提前停止懒加载");
+    /* 提前停止：真实累计采集数达到目标（采全部模式 targetCount=Infinity，永不触发） */
+    if (cc.comments.length >= cc.targetCount) {
+      console.log("[DouyinCollector] loadAllComments: 已采集 " + cc.comments.length + " 达到目标 " + cc.targetCount + " → 提前停止懒加载");
       break;
     }
 
-    if (currentHeight === lastHeight) {
+    setCommentState("running", "加载中... 已采集 " + cc.comments.length + (Number.isFinite(cc.targetCount) ? " / " + cc.targetCount : "") + " 条");
+
+    container.scrollTop = container.scrollHeight;
+    await sleep(1500);
+    const currentHeight = container.scrollHeight;
+
+    if (currentHeight === lastHeight && addedThisRound === 0) {
       stableCount++;
-      console.log("[DouyinCollector] loadAllComments round " + round + ": 高度不变 " + currentHeight + " stable=" + stableCount);
+      console.log("[DouyinCollector] loadAllComments round " + round + ": 高度不变 + 无新增 stable=" + stableCount);
       if (stableCount >= 3) {
         if (hasNoMoreCommentTip()) {
           console.log("[DouyinCollector] loadAllComments: 连续3轮无变化 + 没有更多提示 → 加载完成");
@@ -151,7 +185,7 @@ async function loadAllComments() {
       await sleep(800);
     } else {
       stableCount = 0;
-      console.log("[DouyinCollector] loadAllComments round " + round + ": 高度 " + lastHeight + " → " + currentHeight);
+      console.log("[DouyinCollector] loadAllComments round " + round + ": 高度 " + lastHeight + " → " + currentHeight + " 本轮新增 " + addedThisRound);
     }
     lastHeight = currentHeight;
 
@@ -163,9 +197,9 @@ async function loadAllComments() {
 
   container.scrollTop = 0;
   await sleep(500);
-  const count = countCommentCards();
-  console.log("[DouyinCollector] loadAllComments 完成: 预计 " + count + " 条评论卡片");
-  setCommentState("running", "评论加载完成，预计 " + count + " 条，开始展开...");
+  await persistComments();
+  console.log("[DouyinCollector] loadAllComments 完成: 累计采集 " + cc.comments.length + " 条");
+  setCommentState("running", "评论加载完成，已采集 " + cc.comments.length + " 条，开始展开...");
 }
 
 /* ---- 阶段3: 展开所有折叠内容（回复 + 长文本 合并为一次扫描） ---- */
@@ -196,9 +230,9 @@ async function expandAllContent() {
   for (let pass = 0; pass < 200; pass++) {
     if (!cc.running) return;
 
-    /* 提前停止：已采集足够多 */
-    if (cc.comments.length >= cc.options.maxComments * 1.2) {
-      console.log("[DouyinCollector]   pass " + pass + ": 已采集 " + cc.comments.length + ", 接近上限 → 停止展开");
+    /* 提前停止：已采集足够多（采全部模式 targetCount=Infinity，永不触发） */
+    if (cc.comments.length >= cc.targetCount) {
+      console.log("[DouyinCollector]   pass " + pass + ": 已采集 " + cc.comments.length + " 达到目标 → 停止展开");
       break;
     }
 
@@ -320,7 +354,7 @@ async function collectAllComments() {
       if (cardNode) cc.cardToComment.set(cardNode, cc.comments.length);
       cc.comments.push(it);
       added++;
-      if (cc.comments.length >= cc.options.maxComments) break;
+      if (cc.comments.length >= cc.targetCount) break;
     }
     return { added, updated };
   };
@@ -349,6 +383,9 @@ async function collectAllComments() {
     totalAdded += r3.added; totalUpdated += r3.updated;
     if (r3.added === 0) {
       cc.comments = dedupeArr(cc.comments);
+      if (!cc.options.collectAll && Number.isFinite(cc.targetCount) && cc.comments.length > cc.targetCount) {
+        cc.comments = cc.comments.slice(0, cc.targetCount);
+      }
       cc.seen = new Set(cc.comments.map(commentKey));
       cc.progress.added = totalAdded;
       console.log("[DouyinCollector] collectAllComments: 短路命中，DOM 数据已全, 跳过逐段滚动");
@@ -406,10 +443,14 @@ async function collectAllComments() {
       stableCount = 0;
     }
 
-    if (cc.comments.length >= cc.options.maxComments) break;
+    if (cc.comments.length >= cc.targetCount) break;
   }
 
   cc.comments = dedupeArr(cc.comments);
+  /* 采指定条数模式：去重后若超出目标，截断到精确条数 */
+  if (!cc.options.collectAll && Number.isFinite(cc.targetCount) && cc.comments.length > cc.targetCount) {
+    cc.comments = cc.comments.slice(0, cc.targetCount);
+  }
   cc.seen = new Set(cc.comments.map(commentKey));
   cc.progress.added = totalAdded;
   console.log("[DouyinCollector] collectAllComments 完成: " + pass + " 轮, 新增 " + totalAdded + " 更新 " + totalUpdated + " 累计 " + cc.comments.length);
@@ -765,6 +806,40 @@ function extractVisibleComments() {
 }
 
 function findCommentCandidates() {
+  /* ★ 锚点优先：抖音每条评论卡片都有稳定的 data-e2e="comment-item"。
+   * 直接以它为硬边界逐条切割，能彻底解决"相邻评论文本/图片粘连串行"的错位 bug。
+   * 只有当页面上一个 comment-item 都没有（抖音改版）时，才回退到旧的打分扫描法。 */
+  const anchored = findCommentItemsByAnchor();
+  if (anchored.length) return anchored;
+  return findCommentCandidatesByScore();
+}
+
+/* 基于 data-e2e="comment-item" 锚点的逐卡片识别（首选） */
+function findCommentItemsByAnchor() {
+  const containers = findCommentScrollContainers();
+  const scopes = containers.length ? containers : [document.body];
+  const seenNodes = new Set();
+  const out = [];
+  for (const scope of scopes) {
+    const items = Array.from(scope.querySelectorAll('[data-e2e="comment-item"]'));
+    for (const node of items) {
+      if (seenNodes.has(node) || !isRendered(node)) continue;
+      seenNodes.add(node);
+      out.push(node);
+    }
+  }
+  /* 保持 DOM 顺序（主评论 + 它下面的回复自然相邻） */
+  out.sort((a, b) => {
+    const pos = a.compareDocumentPosition(b);
+    if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    return 0;
+  });
+  return out;
+}
+
+/* 旧的打分扫描法（仅在锚点失效时兜底） */
+function findCommentCandidatesByScore() {
   const containers = findCommentScrollContainers();
   if (!containers.length) return [];
   const scored = [];
@@ -789,6 +864,93 @@ function findCommentCandidates() {
     unique.push(card);
   }
   return unique;
+}
+
+/* ================================================================
+ *  锚点卡片字段提取（只在自身卡片头部取值，不越界到楼中楼）
+ * ================================================================ */
+
+/* 把一条 comment-item 的"自身头部"切出来：从卡片开头到第一个嵌套回复容器之前。
+ * 这样图片/作者标记/时间都只算自己这条，不会把楼中楼回复的内容算进来。 */
+function commentOwnScope(node) {
+  /* 找第一个嵌套的回复容器（楼中楼），它之后的内容属于子评论 */
+  const replyBox = node.querySelector('[class*="replyContainer"], [class*="ReplyContainer"], [data-e2e*="reply"]');
+  if (!replyBox || !node.contains(replyBox)) return node;
+  return { node, boundary: replyBox };
+}
+
+/* 判断某个后代元素是否落在「自身头部」内（在第一个回复容器之前） */
+function isInOwnHead(node, el) {
+  const replyBox = node.querySelector('[class*="replyContainer"], [class*="ReplyContainer"], [data-e2e*="reply"]');
+  if (!replyBox) return true;
+  /* el 在 replyBox 之前 → 属于自身头部 */
+  const pos = replyBox.compareDocumentPosition(el);
+  return Boolean(pos & Node.DOCUMENT_POSITION_PRECEDING);
+}
+
+/* 用户名：锚点优先 data-click-from="title"，回退到首个 a[href*=/user/] 文本 */
+function extractAnchorUserName(node) {
+  const titleEl = node.querySelector('[data-click-from="title"]');
+  if (titleEl && isInOwnHead(node, titleEl)) {
+    const t = cleanText(titleEl.innerText || titleEl.textContent || "");
+    if (t) return t;
+  }
+  const link = pickBestUserLink(node);
+  if (link) {
+    const t = cleanText(link.innerText || "");
+    if (t) return t;
+  }
+  return "";
+}
+
+/* 评论正文：抖音用 .Pmn4RZdg 容器包正文，里面是 .ikxmLIZA span。
+ * 用 DOM 取而不是文本行猜测，避免把楼层时间/统计/楼中楼粘进来。 */
+function extractAnchorContent(node) {
+  /* 找正文容器：优先 class 命中，其次结构兜底 */
+  let box = null;
+  for (const sel of ['.Pmn4RZdg', '[class*="comment-content"]']) {
+    const c = node.querySelector(sel);
+    if (c && isInOwnHead(node, c)) { box = c; break; }
+  }
+  if (box) {
+    const t = cleanText(box.innerText || box.textContent || "");
+    if (t) return t;
+  }
+  /* 结构兜底：用户名链接所在行之后、时间行之前的最长文本块 */
+  return "";
+}
+
+/* 时间·地区：.WQp8eISZ 容器 */
+function extractAnchorTime(node) {
+  for (const sel of ['.WQp8eISZ', '[class*="time"]']) {
+    const c = node.querySelector(sel);
+    if (c && isInOwnHead(node, c)) {
+      const t = cleanText(c.innerText || c.textContent || "");
+      if (t && /刚刚|前|\d{4}-\d|\d{1,2}-\d{1,2}/.test(t)) return t.split(/[·•]/)[0].trim();
+    }
+  }
+  return "";
+}
+
+/* 作者标记：评论卡片头部出现"作者"标签（comment-item-tag-text） */
+function extractAnchorIsAuthor(node) {
+  const tags = Array.from(node.querySelectorAll('[class*="comment-item-tag-text"], [class*="author"]'));
+  for (const t of tags) {
+    if (!isInOwnHead(node, t)) continue;
+    if (/^作者$/.test(cleanText(t.innerText || t.textContent || ""))) return true;
+  }
+  return false;
+}
+
+/* 是否为楼中楼回复：祖先里有 replyContainer */
+function extractAnchorIsReply(node) {
+  let cur = node.parentElement;
+  for (let i = 0; cur && i < 12; i++) {
+    const cls = String(cur.className || "");
+    if (/replyContainer|ReplyContainer/.test(cls)) return true;
+    cur = cur.parentElement;
+  }
+  return false;
 }
 
 function countCommentCards() {
@@ -837,6 +999,11 @@ function shrinkToCommentCard(node) {
 }
 
 function parseCommentNode(node) {
+  /* ★ 如果是锚点卡片（data-e2e="comment-item"），走精确 DOM 提取 */
+  const isAnchor = node.matches && node.matches('[data-e2e="comment-item"]');
+  if (isAnchor) return parseAnchorComment(node);
+
+  /* 否则走旧的文本行解析（兜底） */
   const raw = cleanText(node.innerText || "");
   if (!raw) return null;
   const lines = raw.split("\n").map(cleanText).filter(Boolean);
@@ -868,6 +1035,125 @@ function parseCommentNode(node) {
     source: "douyin-web-extension",
     __cardNode: node
   };
+}
+
+/* ★ 精确解析一条 comment-item 锚点卡片（只取自身字段，逐卡片硬边界） */
+function parseAnchorComment(node) {
+  const userName = extractAnchorUserName(node);
+  if (!isValidUserName(userName)) return null;
+
+  let commentText = extractAnchorContent(node);
+  /* 内容为空但有图片是合法的（纯图评论）；都没有才丢弃 */
+  const isAuthor = extractAnchorIsAuthor(node);
+  const isReply = extractAnchorIsReply(node);
+
+  /* 图片：只取自身头部（不含楼中楼），并复用 v0.7.0 的表情/贴纸过滤 */
+  const imageUrls = extractAnchorImageUrls(node);
+
+  if (!commentText && !imageUrls.length) return null;
+  if (commentText && (isTimeLike(commentText) || commentText === "..." || commentText === "…")) commentText = "";
+  if (!commentText && !imageUrls.length) return null;
+
+  const userLink = pickBestUserLink(node);
+  const commentTime = extractAnchorTime(node);
+
+  /* 父级用户：楼中楼回复时，向上找最近的主评论卡片用户名 */
+  let parentUserName = "";
+  if (isReply) parentUserName = findParentMainUser(node);
+
+  const ids = extractCommentIdentity(node);
+  return {
+    videoUrl: location.href, commentId: ids.commentId, domId: ids.domId,
+    userName: userName,
+    userProfileUrl: userLink ? safeAbsUrl(userLink.getAttribute("href")) : "",
+    commentText: commentText,
+    likeCount: extractAnchorMetric(node, "like"),
+    replyCount: extractAnchorMetric(node, "reply"),
+    commentTime: commentTime,
+    isAuthor: isAuthor,
+    level: isReply ? "reply" : "main",
+    parentUserName: parentUserName,
+    parentCommentText: "",
+    replyToUserName: pickReplyToUser(commentText),
+    commentImageUrls: imageUrls,
+    collectedAt: new Date().toISOString(),
+    source: "douyin-web-extension",
+    __cardNode: node
+  };
+}
+
+/* ★ 表情/emoji 判据（用户实测最可靠）：表情 img 带 alt（如 alt="[偷笑]"），
+ *   用户真实上传图的 img 没有 alt 属性。带非空 alt → 判为表情。 */
+function isEmojiByAlt(img) {
+  if (!img || !img.hasAttribute) return false;
+  if (!img.hasAttribute("alt")) return false;
+  const alt = cleanText(img.getAttribute("alt") || "");
+  return alt.length > 0;
+}
+
+/* 图片：限定在卡片自身头部（第一个回复容器之前），再过滤头像/表情/贴纸 */
+function extractAnchorImageUrls(node) {
+  const replyBox = node.querySelector('[class*="replyContainer"], [class*="ReplyContainer"], [data-e2e*="reply"]');
+  const urls = [];
+  for (const img of Array.from(node.querySelectorAll("img"))) {
+    if (replyBox && node.contains(replyBox)) {
+      const pos = replyBox.compareDocumentPosition(img);
+      if (!(pos & Node.DOCUMENT_POSITION_PRECEDING)) continue;
+    }
+    if (isEmojiByAlt(img)) continue;
+    const src = img.currentSrc || img.src || img.getAttribute("src") || "";
+    if (isStickerOrEmojiUrl(src)) continue;
+    if (isLikelyAvatar(img) || !isRendered(img)) continue;
+    if (/aweme-avatar|\/avatar|user-avatar/i.test(src)) continue;
+    const cands = [src].concat(parseSrcset(img.getAttribute("srcset")));
+    for (const u of cands) { if (isStickerOrEmojiUrl(u)) continue; const n = normalizeMediaUrl(u); if (n && !urls.includes(n)) urls.push(n); }
+  }
+  return urls;
+}
+
+/* 向上找最近的主评论卡片用户名（楼中楼父级） */
+function findParentMainUser(node) {
+  let cur = node.parentElement;
+  for (let i = 0; cur && i < 20; i++) {
+    const cls = String(cur.className || "");
+    if (/replyContainer|ReplyContainer/.test(cls)) {
+      /* 回复容器的上一个兄弟/父级里应该有主评论 */
+      let host = cur.parentElement;
+      while (host && i < 20) {
+        const mainItem = host.querySelector(':scope > [data-e2e="comment-item"]')
+                       || (host.matches && host.matches('[data-e2e="comment-item"]') ? host : null);
+        if (mainItem && mainItem !== node) return extractAnchorUserName(mainItem);
+        host = host.parentElement; i++;
+      }
+    }
+    cur = cur.parentElement;
+  }
+  return "";
+}
+
+/* 点赞数：自身头部 .BCP3FTai 里的数字 span；回复数：兜底从文本里取"N条回复" */
+function extractAnchorMetric(node, type) {
+  if (type === "like") {
+    const p = node.querySelector('p[class*="BCP3FTai"], [class*="comment-item-stats"] p');
+    if (p && isInOwnHead(node, p)) {
+      const t = cleanText(p.innerText || p.textContent || "");
+      const m = t.match(/[\d\.]+\s*[万wW]?/);
+      if (m) return m[0].replace(/\s+/g, "");
+    }
+    return "";
+  }
+  if (type === "reply") {
+    /* 回复数：找"N条回复"按钮文本 */
+    const btns = Array.from(node.querySelectorAll('span, div, p'));
+    for (const b of btns) {
+      if (!isInOwnHead(node, b)) continue;
+      const t = cleanText(b.innerText || "");
+      const m = t.match(/^(\d[\d\.]*\s*[万wW]?)\s*条?回复$/);
+      if (m) return m[1].replace(/\s+/g, "");
+    }
+    return "";
+  }
+  return "";
 }
 
 function extractCommentIdentity(node) {
@@ -993,19 +1279,23 @@ function extractCommentImageUrls(root) {
   const isCommentItemRoot = root.matches && (root.matches('[data-e2e="comment-item"]') || root.closest('[data-e2e="comment-item"]'));
   /* 即使 root 不是 comment-item，也尝试找内部的 [aweme_comment] 风格的 img */
   for (const img of Array.from(root.querySelectorAll("img"))) {
+    /* ★ 表情/emoji 带 alt（如 alt="[偷笑]"），真实上传图无 alt → 带非空 alt 一律排除 */
+    if (isEmojiByAlt(img)) continue;
     const src = img.currentSrc || img.src || img.getAttribute("src") || "";
+    /* ★ 表情包 / 贴纸 / emoji 一律排除（不是用户真正上传的图片） */
+    if (isStickerOrEmojiUrl(src)) continue;
     /* URL 含 aweme_comment / sign.douyinpic.com 或位于 comment-item 容器 → 直接认定是评论图 */
     const isAwemeCommentUrl = /aweme_comment|sign\.douyinpic|tos-cn-i-[a-z0-9]+\/[A-Za-z0-9]/.test(src);
     const isInsideCommentItem = !!img.closest('[data-e2e="comment-item"]');
     if ((isAwemeCommentUrl || isInsideCommentItem) && !isLikelyAvatar(img) && isRendered(img)) {
       const cands = [src].concat(parseSrcset(img.getAttribute("srcset")));
-      for (const u of cands) { const n = normalizeMediaUrl(u); if (n && !urls.includes(n)) urls.push(n); }
+      for (const u of cands) { if (isStickerOrEmojiUrl(u)) continue; const n = normalizeMediaUrl(u); if (n && !urls.includes(n)) urls.push(n); }
       continue;
     }
     /* 走通用判定 */
     if (!isCommentImage(img)) continue;
     const cands = [src].concat(parseSrcset(img.getAttribute("srcset")));
-    for (const u of cands) { const n = normalizeMediaUrl(u); if (n && !urls.includes(n)) urls.push(n); }
+    for (const u of cands) { if (isStickerOrEmojiUrl(u)) continue; const n = normalizeMediaUrl(u); if (n && !urls.includes(n)) urls.push(n); }
   }
   /* 2. background-image（抖音有些图片用背景图） */
   for (const el of Array.from(root.querySelectorAll("*"))) {
@@ -1014,6 +1304,7 @@ function extractCommentImageUrls(root) {
     if (!bg || bg === "none") continue;
     const m = bg.match(/url\(["']?(.*?)["']?\)/);
     if (m && m[1]) {
+      if (isStickerOrEmojiUrl(m[1])) continue;
       const n = normalizeMediaUrl(m[1]);
       if (n && !urls.includes(n) && !/avatar|emoji|icon|logo/i.test(n)) urls.push(n);
     }
@@ -1021,12 +1312,45 @@ function extractCommentImageUrls(root) {
   return urls;
 }
 
+/* ★ 表情包 / 贴纸 / emoji 判定：命中即排除。
+ * 抖音评论里有两类"图片"：
+ *   ① 用户真正上传的图片  → 要采集
+ *      路径形如 /obj/tos-cn-i-tsj2vxp0zn/<hash>，无 sticker 标记
+ *   ② 表情包 / 贴纸 / emoji → 不采集
+ *      - s=sticker_comment 或 sc=sticker_heif 查询参数
+ *      - tos-cn-o-0812 路径（贴纸专用桶）
+ *      - ies.fe.effect / effect 特效贴纸
+ *      - twemoji/xxxx.png（Twitter emoji 小图标）
+ *      - emoji / sticker 关键字 */
+function isStickerOrEmojiUrl(url) {
+  if (!url) return false;
+  const u = String(url).toLowerCase();
+  /* 查询参数明确标记是贴纸/表情 */
+  if (/[?&]s=sticker/.test(u)) return true;
+  if (/[?&]sc=sticker/.test(u)) return true;
+  if (/sticker_comment|sticker_heif/.test(u)) return true;
+  /* 贴纸 / 特效专用路径桶 */
+  if (/tos-cn-o-0812/.test(u)) return true;
+  if (/ies\.fe\.effect|\/effect\//.test(u)) return true;
+  /* Twitter emoji 小图标 */
+  if (/twemoji/.test(u)) return true;
+  if (/\/72x72\//.test(u)) return true;
+  /* 通用 emoji / sticker / 表情 关键字 */
+  if (/sticker|emoji|biz_tag=sticker/.test(u)) return true;
+  /* 注：v0.7.2 曾加 ~tplv- + from=2064092626 规则，副作用过大（漏采、误删真实图），已回退到 v0.7.1 行为 */
+  return false;
+}
+
 function isCommentImage(img) {
   if (!isRendered(img)) return false;
+  /* ★ 表情/emoji 带 alt（如 alt="[偷笑]"），真实上传图无 alt → 带非空 alt 一律排除 */
+  if (isEmojiByAlt(img)) return false;
   const alt = cleanText(img.getAttribute("alt") || "");
-  /* 只过滤明显的头像/系统图标，不过滤"表情"——贴纸表情可能用 alt="表情" */
+  /* 只过滤明显的头像/系统图标 */
   if (/头像\b|avatar|user-avatar|aweme-avatar|logo|badge/i.test(alt)) return false;
   const src = img.currentSrc || img.src || img.getAttribute("src") || "";
+  /* ★ 表情包/贴纸/emoji 一律排除 */
+  if (isStickerOrEmojiUrl(src)) return false;
   /* 抖音评论图特征 URL：直接放行 */
   if (/aweme_comment|sign\.douyinpic\.com\/tos-cn-i-/i.test(src)) {
     if (!isLikelyAvatar(img)) return true;
@@ -1046,9 +1370,9 @@ function isCommentImage(img) {
   if (w < 28 || h < 28) return false;
   /* 头像通常严格正方形 + 在评论卡片左侧，且尺寸 36~64 — 用 DOM 上下文判断 */
   if (isLikelyAvatar(img)) return false;
-  /* URL特征匹配 - 直接命中 */
+  /* URL特征匹配 - 直接命中（注意：已在开头排除 sticker） */
   const urlLower = src.toLowerCase();
-  if (/tos-cn.*\/object|byteimg|douyinpic|aweme.*image|comment.*image|sticker/i.test(urlLower)) return true;
+  if (/tos-cn.*\/object|byteimg|douyinpic|aweme.*image|comment.*image/i.test(urlLower)) return true;
   if (/\.(jpg|jpeg|png|webp|avif|gif)(\?|$)/i.test(urlLower) && w >= 40 && h >= 40) return true;
   /* 宽高比合理且尺寸够大 → 认为是评论图片 */
   const ratio = w / h;
@@ -1086,6 +1410,8 @@ function parseSrcset(srcset) {
 
 function normalizeMediaUrl(url) {
   if (!url || /^data:|^blob:|^chrome-extension:|^about:/.test(url)) return "";
+  /* ★ 双重保险：表情包/贴纸/emoji 一律不返回 */
+  if (isStickerOrEmojiUrl(url)) return "";
   try {
     const a = new URL(url, location.href).href;
     /* 图片文件扩展名 */
@@ -1493,7 +1819,20 @@ function ensureFloatingPanel() {
     #douyin-comment-collector-float .wb-msg { min-height: 32px; color: #5f554b; font-size: 12px; line-height: 1.45; background: #fff; border: 1px solid rgba(120,96,64,0.12); border-radius: 12px; padding: 8px; margin-bottom: 10px; }
     #douyin-comment-collector-float .wb-settings { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
     #douyin-comment-collector-float .wb-field label { display: block; font-size: 11px; color: #7b6f64; margin: 0 0 4px 2px; }
-    #douyin-comment-collector-float .wb-field input { width: 100%; height: 34px; border-radius: 11px; border: 1px solid rgba(120,96,64,0.18); background: #fff; color: #2a211b; font-size: 13px; padding: 0 9px; outline: none; }
+    #douyin-comment-collector-float .wb-field input { width: 100%; height: 34px; border-radius: 11px; border: 1px solid rgba(120,96,64,0.18); background: #fff; color: #2a211b; font-size: 13px; padding: 0 9px; outline: none; box-sizing: border-box; transition: border-color .15s ease, box-shadow .15s ease; }
+    #douyin-comment-collector-float .wb-field input:focus { border-color: #c76538; box-shadow: 0 0 0 3px rgba(199,101,56,0.12); }
+    #douyin-comment-collector-float .wb-field select {
+      width: 100%; height: 34px; border-radius: 11px; border: 1px solid rgba(120,96,64,0.18);
+      background-color: #fff; color: #2a211b; font-size: 13px; padding: 0 30px 0 10px; outline: none;
+      box-sizing: border-box; cursor: pointer; font-family: inherit; font-weight: 500;
+      -webkit-appearance: none; -moz-appearance: none; appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%23c76538' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right 10px center;
+      transition: border-color .15s ease, box-shadow .15s ease;
+    }
+    #douyin-comment-collector-float .wb-field select:hover { border-color: rgba(199,101,56,0.5); }
+    #douyin-comment-collector-float .wb-field select:focus { border-color: #c76538; box-shadow: 0 0 0 3px rgba(199,101,56,0.12); }
+    #douyin-comment-collector-float .wb-field.wb-field-wide { grid-column: 1 / -1; }
     #douyin-comment-collector-float .wb-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
     #douyin-comment-collector-float button { height: 34px; border-radius: 11px; border: 1px solid rgba(120,96,64,0.18); background: #fff; color: #2a211b; font-size: 13px; cursor: pointer; }
     #douyin-comment-collector-float button:hover { background: #fff7ed; }
@@ -1521,7 +1860,11 @@ function ensureFloatingPanel() {
         <div class="wb-stat"><span>新增</span><strong data-role="added">0</strong></div>
       </div>
       <div class="wb-settings">
-        <div class="wb-field"><label>最大评论</label><input data-role="max-comments" type="number" min="1" max="10000" value="5000"></div>
+        <div class="wb-field wb-field-wide"><label>采集模式</label><select data-role="collect-mode">
+          <option value="limit">采指定条数</option>
+          <option value="all">采全部评论</option>
+        </select></div>
+        <div class="wb-field" data-role="max-field"><label>目标条数</label><input data-role="max-comments" type="number" min="1" max="10000" value="5000"></div>
         <div class="wb-field"><label>间隔ms</label><input data-role="delay-ms" type="number" min="500" max="15000" value="2000"></div>
       </div>
       <div class="wb-msg" data-role="message">点"开始"自动执行：加载→展开→采集</div>
@@ -1582,6 +1925,18 @@ function bindFloatingPanel(panel) {
     if (action === "export-json") await exportFloatingComments("json");
     updateFloatingPanel();
   }, true);
+
+  /* 采集模式切换：采全部时隐藏「目标条数」输入框 */
+  const modeSel = panel.querySelector('[data-role="collect-mode"]');
+  const maxField = panel.querySelector('[data-role="max-field"]');
+  const syncModeUI = () => {
+    if (!modeSel || !maxField) return;
+    maxField.style.display = modeSel.value === "all" ? "none" : "";
+  };
+  if (modeSel) {
+    modeSel.addEventListener("change", e => { e.stopPropagation(); syncModeUI(); }, true);
+    syncModeUI();
+  }
 }
 
 async function restoreFloatingPanelPosition(panel) {
@@ -1596,9 +1951,12 @@ function readFloatingOptions() {
   const panel = document.getElementById("douyin-comment-collector-float");
   const maxInput = panel && panel.querySelector('[data-role="max-comments"]');
   const delayInput = panel && panel.querySelector('[data-role="delay-ms"]');
+  const modeSel = panel && panel.querySelector('[data-role="collect-mode"]');
   const current = cc.options || {};
+  const collectAll = modeSel ? modeSel.value === "all" : Boolean(current.collectAll);
   return {
     ...current,
+    collectAll,
     maxComments: cl(Number(maxInput && maxInput.value) || current.maxComments || 5000, 1, 10000, 5000),
     delayMs: cl(Number(delayInput && delayInput.value) || current.delayMs || 2000, 500, 15000, 2000),
     collectReplies: current.collectReplies !== false,
@@ -1619,7 +1977,7 @@ async function exportFloatingComments(format) {
 }
 
 function exportCommentsToCsvLocal(comments) {
-  const headers = ["序号","用户名","用户主页","评论内容","点赞数","回复数","时间","层级","父级用户","被回复人","图片链接","采集时间"];
+  const headers = ["序号","用户名","是否作者","用户主页","评论内容","点赞数","回复数","时间","层级","父级用户","被回复人","图片链接","采集时间"];
   const esc = v => { const t = String(v == null ? "" : v).replace(/[\r\n]+/g, " "); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
   const rows = [headers.join(",")];
   const arr = comments || [];
@@ -1628,12 +1986,13 @@ function exportCommentsToCsvLocal(comments) {
     rows.push([
       i + 1,
       c.userName || "",
+      c.isAuthor ? "是" : "",
       c.userProfileUrl || "",
       c.commentText || "",
       c.likeCount || "",
       c.replyCount || "",
       c.commentTime || "",
-      c.level === "reply" ? "回复" : "一级",
+      c.level === "reply" ? "回复" : "主评论",
       c.parentUserName || "",
       c.replyToUserName || "",
       Array.isArray(c.commentImageUrls) ? c.commentImageUrls.join(" | ") : (c.commentImageUrls || ""),
@@ -1673,6 +2032,13 @@ function updateFloatingPanel() {
   if (msg) msg.textContent = cc.state.message || "Ready";
   if (maxInput && document.activeElement !== maxInput) maxInput.value = String((cc.options && cc.options.maxComments) || 5000);
   if (delayInput && document.activeElement !== delayInput) delayInput.value = String((cc.options && cc.options.delayMs) || 2000);
+  /* 同步采集模式下拉 + 目标条数框显隐 */
+  const modeSel = panel.querySelector('[data-role="collect-mode"]');
+  const maxField = panel.querySelector('[data-role="max-field"]');
+  if (modeSel && document.activeElement !== modeSel) {
+    modeSel.value = (cc.options && cc.options.collectAll) ? "all" : "limit";
+  }
+  if (modeSel && maxField) maxField.style.display = modeSel.value === "all" ? "none" : "";
   /* 按钮状态联动：未运行时开始橙色，运行中停止橙色 */
   const startBtn = panel.querySelector('[data-role="btn-start"]');
   const stopBtn = panel.querySelector('[data-role="btn-stop"]');
